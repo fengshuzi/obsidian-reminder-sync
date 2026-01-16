@@ -1,0 +1,19 @@
+{
+    "appName": "提醒事项记账同步",
+    "categories": {
+        "cy": "餐饮",
+        "jt": "交通",
+        "yl": "娱乐",
+        "gw": "购物",
+        "yy": "医疗",
+        "jy": "教育",
+        "fz": "房租",
+        "qt": "其他",
+        "sr": "收入"
+    },
+    "expenseEmoji": "💰",
+    "journalsPath": "journals",
+    "reminderListName": "Inbox",
+    "autoSync": false,
+    "syncInterval": 300000
+}
