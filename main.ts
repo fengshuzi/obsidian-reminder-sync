@@ -96,16 +96,28 @@ export default class ReminderSyncPlugin extends Plugin {
             callback: () => this.previewSyncReminders()
         });
 
+        // 添加命令：同步日记任务到提醒事项
+        this.addCommand({
+            id: 'sync-journals-to-reminders',
+            name: '同步到提醒事项',
+            callback: () => this.syncJournalsToReminders()
+        });
+
         // 如果启用自动同步，启动定时任务
         if (this.config.autoSync) {
             this.startAutoSync();
         }
 
-        // 插件加载时异步执行一次同步（不阻塞加载）
+        // 插件加载时异步执行一次双向同步（不阻塞加载）
         setTimeout(() => {
             console.log('[ReminderSync] 插件加载完成，开始后台同步...');
+            // 先同步提醒事项到日记
             this.syncRemindersToJournal(true).catch(err => {
-                console.error('[ReminderSync] 后台同步失败:', err);
+                console.error('[ReminderSync] 提醒到日记同步失败:', err);
+            });
+            // 再同步日记到提醒事项
+            this.syncJournalsToReminders(true).catch(err => {
+                console.error('[ReminderSync] 日记到提醒同步失败:', err);
             });
         }, 1000); // 延迟1秒执行，确保不影响启动
     }
@@ -546,6 +558,117 @@ JSON.stringify(result);
         const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.delete();'ok';`;
         const result = await this.runJXA(script);
         return result !== null;
+    }
+
+    // 创建提醒事项
+    async createReminder(title: string, dueDate: string): Promise<boolean> {
+        const script = `
+var Reminders=Application('Reminders');
+var list=Reminders.lists.whose({name:'${this.config.reminderListName}'})[0];
+var r=Reminders.Reminder({name:'${title}',dueDate:new Date('${dueDate}')});
+list.reminders.push(r);
+'ok';
+        `.replace(/\n/g, '');
+        const result = await this.runJXA(script);
+        return result !== null;
+    }
+
+    // 标记提醒为完成
+    async completeReminder(id: string): Promise<boolean> {
+        const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.completed=true;'ok';`;
+        const result = await this.runJXA(script);
+        return result !== null;
+    }
+
+    // 同步日记中的任务到提醒事项
+    async syncJournalsToReminders(silent = false): Promise<void> {
+        if (!silent) {
+            new Notice('开始同步日记任务到提醒事项...');
+        }
+
+        try {
+            const { vault } = this.app;
+            const journalsPath = this.config.journalsPath;
+
+            // 获取所有日记文件
+            const journalFiles = vault.getMarkdownFiles().filter(file => 
+                file.path.startsWith(journalsPath)
+            );
+
+            let createdCount = 0;
+
+            // 获取所有现有提醒
+            const existingReminders = await this.getReminders();
+
+            for (const file of journalFiles) {
+                const content = await vault.read(file);
+                const lines = content.split('\n');
+
+                for (const line of lines) {
+                    // 跳过已完成的任务
+                    if (line.includes('[x]') || line.includes('[X]') || line.includes('DONE')) {
+                        continue;
+                    }
+
+                    // 匹配带有日期的任务，支持多种格式：
+                    // - [ ] 任务 @2026-01-16
+                    // - TODO 任务 @2026-01-16
+                    // - TODO 11:45 任务 @2026-01-16
+                    const taskMatch = line.match(/^-\s+(?:\[\s\]|TODO)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+                    
+                    if (taskMatch) {
+                        let [, taskTitle, date, hours, minutes] = taskMatch;
+                        
+                        // 如果任务标题开头是时间格式（如 "11:45 任务内容"），提取时间
+                        const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
+                        if (timeInTitle && !hours) {
+                            hours = timeInTitle[1];
+                            minutes = timeInTitle[2];
+                            taskTitle = timeInTitle[3];
+                        }
+                        
+                        // 构建 ISO 格式的日期时间
+                        let dueDate: string;
+                        if (hours && minutes) {
+                            // 包含时间：2026-01-16T10:00:00
+                            dueDate = `${date}T${hours}:${minutes}:00`;
+                        } else {
+                            // 只有日期：2026-01-16T09:00:00（默认早上9点）
+                            dueDate = `${date}T09:00:00`;
+                        }
+
+                        // 检查提醒是否已存在（通过标题和日期匹配）
+                        const existingReminder = existingReminders.find(r => {
+                            if (r.title !== taskTitle.trim()) return false;
+                            if (!r.due) return false;
+                            
+                            // 比较日期部分
+                            const reminderDate = r.due.split('T')[0];
+                            const taskDate = date;
+                            return reminderDate === taskDate;
+                        });
+
+                        if (!existingReminder) {
+                            // 提醒不存在，创建新提醒
+                            await this.createReminder(taskTitle.trim(), dueDate);
+                            createdCount++;
+                            console.log(`[ReminderSync] 创建提醒: ${taskTitle} @${date}${hours ? ' ' + hours + ':' + minutes : ''}`);
+                        }
+                    }
+                }
+            }
+
+            if (!silent) {
+                new Notice(`同步完成！创建 ${createdCount} 个提醒`);
+            }
+            console.log(`[ReminderSync] 日记到提醒同步完成: 创建 ${createdCount} 个提醒`);
+
+        } catch (error) {
+            console.error('[ReminderSync] 同步失败:', error);
+            if (!silent) {
+                new Notice('同步失败，请查看控制台');
+            }
+        }
     }
 
     // 同步记账到指定日期的日记
