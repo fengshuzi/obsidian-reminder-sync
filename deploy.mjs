@@ -13,19 +13,11 @@ const NOTE_DEMO_PATH = join(
   'Library/Mobile Documents/iCloud~md~obsidian/Documents/note-demo'
 );
 
-// 定义所有 vault 的插件目录
+// 定义所有 vault 的插件目录（只部署到桌面端）
 const vaults = [
-  {
-    name: 'Mobile',
-    path: join(BASE_PATH, '.obsidian-mobile/plugins/obsidian-reminder-sync')
-  },
   {
     name: 'Pro',
     path: join(BASE_PATH, '.obsidian-pro/plugins/obsidian-reminder-sync')
-  },
-  {
-    name: 'iPad',
-    path: join(BASE_PATH, '.obsidian-ipad/plugins/obsidian-reminder-sync')
   },
   {
     name: '2017',
