@@ -28,6 +28,7 @@ interface Reminder {
     title: string;
     due?: string;
     list: string;
+    completed: boolean; // 是否已完成
 }
 
 // 记账记录接口
@@ -213,23 +214,35 @@ export default class ReminderSyncPlugin extends Plugin {
         }
     }
 
-    // 获取提醒事项
+    // 获取提醒事项（包括未完成的和最近3天已完成的）
     async getReminders(): Promise<Reminder[]> {
+        // 计算3天前的日期
+        const threeDaysAgo = new Date();
+        threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+        const threeDaysAgoISO = threeDaysAgo.toISOString();
+        
         const script = `
 var Reminders=Application('Reminders');
 var result=[];
 var lists=Reminders.lists();
 var listCount=lists.length;
+var threeDaysAgo=new Date('${threeDaysAgoISO}');
 for(var i=0;i<listCount;i++){
     var list=lists[i];
     var listName=list.name();
     if(listName!=='${this.config.reminderListName}')continue;
-    var reminders=list.reminders.whose({completed:false})();
-    var reminderCount=reminders.length;
+    var allReminders=list.reminders();
+    var reminderCount=allReminders.length;
     for(var j=0;j<reminderCount;j++){
-        var r=reminders[j];
-        var item={title:r.name(),id:r.id(),list:listName};
+        var r=allReminders[j];
+        var isCompleted=r.completed();
         var dueDate=r.dueDate();
+        if(isCompleted){
+            if(!dueDate||dueDate.toString()==='missing value')continue;
+            var dueDateTime=new Date(dueDate);
+            if(dueDateTime<threeDaysAgo)continue;
+        }
+        var item={title:r.name(),id:r.id(),list:listName,completed:isCompleted};
         if(dueDate&&dueDate.toString()!=='missing value'){
             item.due=dueDate.toISOString();
         }
@@ -762,8 +775,54 @@ list.reminders.push(r);
             if (hasTask) {
                 console.log(`[ReminderSync] 已同步文件: ${file.path}`);
                 
+                // 反向同步：将提醒事项中已完成的任务标记到笔记中
+                let markedDoneCount = 0;
+                const completedReminders = existingReminders.filter(r => r.completed);
+                
+                if (completedReminders.length > 0) {
+                    let updatedContent = content;
+                    let contentChanged = false;
+                    
+                    for (const reminder of completedReminders) {
+                        if (!reminder.due) continue;
+                        
+                        const reminderDate = reminder.due.split('T')[0];
+                        const reminderTitle = reminder.title;
+                        
+                        // 查找笔记中对应的未完成任务
+                        const taskPattern = new RegExp(
+                            `^(-\\s+(?:\\[\\s\\]|TODO))\\s+(.+?)\\s+@${reminderDate.replace(/[-]/g, '\\-')}(?:\\s+\\d{2}:\\d{2})?$`,
+                            'gm'
+                        );
+                        
+                        updatedContent = updatedContent.replace(taskPattern, (match, prefix, taskTitle) => {
+                            // 提取任务标题（可能包含时间前缀）
+                            let cleanTitle = taskTitle.trim();
+                            const timeMatch = cleanTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
+                            if (timeMatch) {
+                                cleanTitle = timeMatch[3];
+                            }
+                            
+                            // 检查标题是否匹配
+                            if (cleanTitle === reminderTitle) {
+                                contentChanged = true;
+                                markedDoneCount++;
+                                // 将任务标记为已完成
+                                return match.replace(/^-\s+(?:\[\s\]|TODO)/, '- DONE');
+                            }
+                            return match;
+                        });
+                    }
+                    
+                    // 如果内容有变化，保存文件
+                    if (contentChanged) {
+                        await this.app.vault.modify(file, updatedContent);
+                        console.log(`[ReminderSync] 标记 ${markedDoneCount} 个任务为已完成`);
+                    }
+                }
+                
                 // 如果配置了显示通知，且有变更
-                if (this.config.notifyOnSync && (createdCount > 0 || completedCount > 0)) {
+                if (this.config.notifyOnSync && (createdCount > 0 || completedCount > 0 || markedDoneCount > 0)) {
                     let message = '';
                     if (createdCount > 0) {
                         message += `创建 ${createdCount} 个提醒`;
@@ -771,6 +830,10 @@ list.reminders.push(r);
                     if (completedCount > 0) {
                         if (message) message += '，';
                         message += `完成 ${completedCount} 个提醒`;
+                    }
+                    if (markedDoneCount > 0) {
+                        if (message) message += '，';
+                        message += `标记 ${markedDoneCount} 个任务为完成`;
                     }
                     new Notice(`同步完成：${message}`);
                 }
