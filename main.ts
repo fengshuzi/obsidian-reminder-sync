@@ -605,33 +605,46 @@ list.reminders.push(r);
                 const lines = content.split('\n');
 
                 for (const line of lines) {
-                    // 跳过已完成的任务
-                    if (line.includes('[x]') || line.includes('[X]') || line.includes('DONE')) {
-                        continue;
-                    }
-
                     // 匹配带有日期的任务，支持多种格式：
                     // - [ ] 任务 @2026-01-16
+                    // - [x] 任务 @2026-01-16（已完成）
                     // - TODO 任务 @2026-01-16
                     // - TODO 11:45 任务 @2026-01-16
-                    const taskMatch = line.match(/^-\s+(?:\[\s\]|TODO)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+                    const taskMatch = line.match(/^-\s+(?:\[([x\sX])\]|TODO)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
                     
                     if (taskMatch) {
-                        let [, taskTitle, date, hours, minutes] = taskMatch;
+                        const [, checkboxStatus, taskTitle, date, hours, minutes] = taskMatch;
+                        
+                        // 检查任务是否已完成
+                        const isCompleted = checkboxStatus === 'x' || checkboxStatus === 'X' || line.includes('DONE');
+                        
+                        // 检查日期是否有效（不是过去的日期）
+                        const taskDate = new Date(date);
+                        const today = new Date();
+                        today.setHours(0, 0, 0, 0); // 重置到当天0点
+                        
+                        if (taskDate < today) {
+                            // 跳过过期任务
+                            continue;
+                        }
+                        
+                        let finalTaskTitle = taskTitle;
+                        let finalHours = hours;
+                        let finalMinutes = minutes;
                         
                         // 如果任务标题开头是时间格式（如 "11:45 任务内容"），提取时间
                         const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
                         if (timeInTitle && !hours) {
-                            hours = timeInTitle[1];
-                            minutes = timeInTitle[2];
-                            taskTitle = timeInTitle[3];
+                            finalHours = timeInTitle[1];
+                            finalMinutes = timeInTitle[2];
+                            finalTaskTitle = timeInTitle[3];
                         }
                         
                         // 构建 ISO 格式的日期时间
                         let dueDate: string;
-                        if (hours && minutes) {
+                        if (finalHours && finalMinutes) {
                             // 包含时间：2026-01-16T10:00:00
-                            dueDate = `${date}T${hours}:${minutes}:00`;
+                            dueDate = `${date}T${finalHours}:${finalMinutes}:00`;
                         } else {
                             // 只有日期：2026-01-16T09:00:00（默认早上9点）
                             dueDate = `${date}T09:00:00`;
@@ -639,7 +652,7 @@ list.reminders.push(r);
 
                         // 检查提醒是否已存在（通过标题和日期匹配）
                         const existingReminder = existingReminders.find(r => {
-                            if (r.title !== taskTitle.trim()) return false;
+                            if (r.title !== finalTaskTitle.trim()) return false;
                             if (!r.due) return false;
                             
                             // 比较日期部分
@@ -648,12 +661,19 @@ list.reminders.push(r);
                             return reminderDate === taskDate;
                         });
 
-                        if (!existingReminder) {
-                            // 提醒不存在，创建新提醒
-                            await this.createReminder(taskTitle.trim(), dueDate);
+                        if (existingReminder) {
+                            // 提醒已存在，检查是否需要标记为完成
+                            if (isCompleted) {
+                                await this.completeReminder(existingReminder.id);
+                                console.log(`[ReminderSync] 标记提醒为完成: ${finalTaskTitle}`);
+                            }
+                        } else if (!isCompleted) {
+                            // 提醒不存在且任务未完成，创建新提醒
+                            await this.createReminder(finalTaskTitle.trim(), dueDate);
                             createdCount++;
-                            console.log(`[ReminderSync] 创建提醒: ${taskTitle} @${date}${hours ? ' ' + hours + ':' + minutes : ''}`);
+                            console.log(`[ReminderSync] 创建提醒: ${finalTaskTitle} @${date}${finalHours ? ' ' + finalHours + ':' + finalMinutes : ''}`);
                         }
+                        // 如果任务已完成且提醒不存在，则不做任何操作（避免创建已完成的提醒）
                     }
                 }
             }
