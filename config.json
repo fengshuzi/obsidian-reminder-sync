@@ -12,6 +12,7 @@
     "reminderListName": "Inbox",
     "autoSync": false,
     "syncInterval": 300000,
+    "notifyOnSync": false,
     "smartKeywords": {
         "cy": ["餐", "吃", "饭", "早餐", "午餐", "晚餐", "宵夜", "食", "菜市场", "菜"],
         "gw": ["购", "买", "购物", "商场", "超市"],
