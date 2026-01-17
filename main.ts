@@ -13,7 +13,7 @@ interface ReminderSyncConfig {
     reminderListName: string;
     autoSync: boolean;
     syncInterval: number;
-    notifyOnSync: boolean; // 同步时是否显示通知
+    notifyOnSync: boolean;
     smartKeywords?: Record<string, string[]>;
     habits?: Record<string, string>;
     habitPrefix?: string;
@@ -28,7 +28,7 @@ interface Reminder {
     title: string;
     due?: string;
     list: string;
-    completed: boolean; // 是否已完成
+    completed: boolean;
 }
 
 // 记账记录接口
@@ -77,60 +77,84 @@ function formatLocalDate(date: Date): string {
  * 3. 自动去重，避免重复创建提醒
  * 
  * 同步锁机制：
- * - 使用 syncLock 互斥锁，确保所有同步操作串行执行
- * - 所有同步函数必须在 finally 块中释放锁
- * - 避免使用提前 return，防止未来维护时忘记释放锁
- * 
- * 重要提示：
- * ⚠️ 修改同步函数时，务必确保 finally 块存在且释放锁
- * ⚠️ 不要在 try 块中使用 return，除非你确定 finally 会执行
+ * - 使用 withSyncLock() 统一管理锁的获取和释放
+ * - 所有同步操作通过队列顺序执行，避免并发问题
+ * - 锁的获取和释放完全由 withSyncLock() 控制，避免手动管理导致的泄漏
  */
 export default class ReminderSyncPlugin extends Plugin {
     config: ReminderSyncConfig;
     syncIntervalId: number | null = null;
-    private syncDebounceTimers: Map<string, number> = new Map(); // 防抖定时器
-    private globalSyncing: boolean = false; // 全局同步标志
-    private syncLock: boolean = false; // 统一的同步锁 - 所有同步操作共享
+    private syncDebounceTimers: Map<string, number> = new Map();
+    private globalSyncing: boolean = false;
+    private syncLock: boolean = false;
+    private syncQueue: Promise<void> = Promise.resolve();
+
+    /**
+     * 统一的锁管理器 - 所有同步操作必须通过此方法执行
+     * 
+     * @param name 操作名称（用于日志）
+     * @param fn 要执行的异步函数
+     * @param skipIfBusy 如果锁被占用是否跳过（true=跳过，false=排队等待）
+     * @returns 执行结果，如果跳过则返回 null
+     */
+    private withSyncLock<T>(name: string, fn: () => Promise<T>, skipIfBusy = false): Promise<T | null> {
+        // 如果设置了 skipIfBusy 且锁被占用，直接跳过
+        if (skipIfBusy && this.syncLock) {
+            console.log(`[ReminderSync] ⏭️ 锁被占用，跳过: ${name}`);
+            return Promise.resolve(null);
+        }
+
+        // 创建任务并加入队列
+        const task = this.syncQueue.then(async (): Promise<T> => {
+            this.syncLock = true;
+            console.log(`[ReminderSync] 🔒 获取锁: ${name}`);
+            
+            try {
+                return await fn();
+            } finally {
+                this.syncLock = false;
+                console.log(`[ReminderSync] 🔓 释放锁: ${name}`);
+            }
+        });
+
+        // 更新队列（忽略错误，确保队列继续）
+        this.syncQueue = task.then(() => {}, () => {});
+        
+        return task;
+    }
 
     async onload() {
         console.log('加载提醒事项记账同步插件');
 
-        // 检查是否为 macOS
         if (!Platform.isMacOS) {
             new Notice('提醒事项记账同步插件仅支持 macOS 系统');
             return;
         }
 
-        // 加载配置
         await this.loadConfig();
 
-        // 添加命令：手动同步
         this.addCommand({
             id: 'sync-reminders-to-journal',
             name: '同步提醒事项到日记',
             callback: () => this.syncRemindersToJournal()
         });
 
-        // 添加命令：查看待同步提醒
         this.addCommand({
             id: 'preview-sync-reminders',
             name: '预览待同步的提醒事项',
             callback: () => this.previewSyncReminders()
         });
 
-        // 添加命令：同步日记任务到提醒事项
         this.addCommand({
             id: 'sync-journals-to-reminders',
             name: '同步到提醒事项',
             callback: () => this.syncJournalsToReminders()
         });
 
-        // 如果启用自动同步，启动定时任务
         if (this.config.autoSync) {
             this.startAutoSync();
         }
 
-        // 注册文件打开事件，自动同步当前笔记的任务
         this.registerEvent(
             this.app.workspace.on('file-open', async (file) => {
                 if (file && file.extension === 'md') {
@@ -139,46 +163,26 @@ export default class ReminderSyncPlugin extends Plugin {
             })
         );
 
-        // 注册活动文件变化事件，切换文件时同步之前的文件
         let previousFile: TFile | null = null;
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', async () => {
                 const currentFile = this.app.workspace.getActiveFile();
-                
-                // 如果之前有文件，同步之前的文件
                 if (previousFile && previousFile.extension === 'md') {
                     this.debounceSyncFile(previousFile);
                 }
-                
-                // 更新当前文件
                 previousFile = currentFile;
             })
         );
 
-        // 插件加载时异步执行一次双向同步（不阻塞加载）
+        // 插件加载时执行一次双向同步
         setTimeout(() => {
             console.log('[ReminderSync] 插件加载完成，开始后台同步...');
-            
-            // 标记全局同步开始
             this.globalSyncing = true;
-            
-            // 先同步提醒事项到日记
-            this.syncRemindersToJournal(true).catch(err => {
-                console.error('[ReminderSync] 提醒到日记同步失败:', err);
-            }).finally(() => {
-                // 等待500ms，让提醒事项系统更新列表（删除操作需要时间生效）
-                setTimeout(() => {
-                    // 再同步日记到提醒事项
-                    this.syncJournalsToReminders(true).catch(err => {
-                        console.error('[ReminderSync] 日记到提醒同步失败:', err);
-                    }).finally(() => {
-                        // 全局同步完成
-                        this.globalSyncing = false;
-                        console.log('[ReminderSync] 后台同步完成');
-                    });
-                }, 500);
+            this.performFullSync(true).finally(() => {
+                this.globalSyncing = false;
+                console.log('[ReminderSync] 后台同步完成');
             });
-        }, 1000); // 延迟1秒执行，确保不影响启动
+        }, 1000);
     }
 
     async onunload() {
@@ -186,7 +190,6 @@ export default class ReminderSyncPlugin extends Plugin {
         this.stopAutoSync();
     }
 
-    // 加载配置
     async loadConfig() {
         const configPath = `${this.manifest.dir}/config.json`;
         const adapter = this.app.vault.adapter;
@@ -201,10 +204,8 @@ export default class ReminderSyncPlugin extends Plugin {
         }
     }
 
-    // 启动自动同步
     startAutoSync() {
         if (this.syncIntervalId) return;
-        
         console.log(`启动自动同步，间隔: ${this.config.syncInterval}ms`);
         this.syncIntervalId = window.setInterval(
             () => this.syncRemindersToJournal(true),
@@ -212,7 +213,6 @@ export default class ReminderSyncPlugin extends Plugin {
         );
     }
 
-    // 停止自动同步
     stopAutoSync() {
         if (this.syncIntervalId) {
             window.clearInterval(this.syncIntervalId);
@@ -221,7 +221,6 @@ export default class ReminderSyncPlugin extends Plugin {
         }
     }
 
-    // 执行 JXA 脚本
     async runJXA(script: string): Promise<any> {
         try {
             const { stdout } = await execAsync(`osascript -l JavaScript -e "${script}"`, {
@@ -234,9 +233,7 @@ export default class ReminderSyncPlugin extends Plugin {
         }
     }
 
-    // 获取提醒事项（包括未完成的和最近3天已完成的）
     async getReminders(): Promise<Reminder[]> {
-        // 计算3天前的日期
         const threeDaysAgo = new Date();
         threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
         const threeDaysAgoISO = threeDaysAgo.toISOString();
@@ -288,30 +285,22 @@ JSON.stringify(result);
         }
     }
 
-    // 解析提醒事项标题，提取记账信息
     parseReminderTitle(title: string): AccountingEntry | null {
         const { categories, expenseEmoji, smartKeywords } = this.config;
         
-        // 检查是否包含数字（必须有数字才认为是记账提醒）
         if (!/\d/.test(title)) {
             return null;
         }
         
-        // 方式1：标准格式 - 包含记账标识符和关键词
         if (title.includes(expenseEmoji)) {
-            // 创建关键词列表，按长度排序
             const keywords = Object.keys(categories).sort((a, b) => b.length - a.length);
             const keywordPattern = keywords.join('|');
-            
-            // 第一步：匹配 #关键词 后面的所有内容（支持无空格格式）
             const keywordRegex = new RegExp(`${expenseEmoji}\\s*(${keywordPattern})\\s*(.+)`, 'i');
             const keywordMatch = keywordRegex.exec(title);
             
             if (keywordMatch) {
                 const keyword = keywordMatch[1];
-                const restContent = keywordMatch[2]; // #cy 后面的所有内容
-                
-                // 第二步：从剩余内容中提取第一个出现的数字作为金额
+                const restContent = keywordMatch[2];
                 const amountRegex = /[\d.]+/;
                 const amountMatch = restContent.match(amountRegex);
                 
@@ -319,9 +308,6 @@ JSON.stringify(result);
                     const amount = parseFloat(amountMatch[0]);
                     if (!isNaN(amount) && amount > 0) {
                         const category = categories[keyword] || '未分类';
-                        
-                        // 第三步：提取描述（移除金额和紧跟的货币单位）
-                        // 匹配金额后面可能跟着的货币单位：块钱、元、块（按长度排序）
                         const amountWithUnit = new RegExp(amountMatch[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(块钱|元|块)?');
                         const description = restContent.replace(amountWithUnit, '').trim();
                         
@@ -338,20 +324,15 @@ JSON.stringify(result);
             }
         }
         
-        // 方式2：智能识别 - 通过关键词自动识别分类
         if (smartKeywords) {
             for (const [keyword, triggers] of Object.entries(smartKeywords)) {
-                // 检查标题是否包含任何触发词
                 const hasTrigger = triggers.some(trigger => title.includes(trigger));
-                
                 if (hasTrigger) {
                     const category = categories[keyword] || '未分类';
-                    
-                    // 智能识别的记账，整个标题作为描述
                     return {
                         keyword,
                         category,
-                        amount: 0, // 金额为0，表示需要手动补充
+                        amount: 0,
                         description: title,
                         date: '',
                         reminderId: ''
@@ -363,7 +344,6 @@ JSON.stringify(result);
         return null;
     }
 
-    // 解析打卡提醒
     parseHabitReminder(title: string): HabitEntry | null {
         const { habits, habitKeywords } = this.config;
         
@@ -371,14 +351,10 @@ JSON.stringify(result);
             return null;
         }
         
-        // 智能识别打卡类型
         for (const [habitKey, triggers] of Object.entries(habitKeywords)) {
-            // 检查标题是否包含任何触发词
             const hasTrigger = triggers.some(trigger => title.includes(trigger));
-            
             if (hasTrigger) {
                 const habitName = habits[habitKey];
-                
                 return {
                     habitKey,
                     habitName,
@@ -392,7 +368,6 @@ JSON.stringify(result);
         return null;
     }
 
-    // 解析视频提醒
     parseVideoReminder(title: string): VideoEntry | null {
         const { videoTypes, videoKeywords } = this.config;
         
@@ -400,25 +375,18 @@ JSON.stringify(result);
             return null;
         }
         
-        // 智能识别视频类型
         for (const [typeKey, triggers] of Object.entries(videoKeywords)) {
-            // 检查标题是否包含任何触发词
             const hasTrigger = triggers.some(trigger => title.includes(trigger));
-            
             if (hasTrigger) {
                 const typeName = videoTypes[typeKey];
-                
-                // 提取视频名称和评论
                 let videoTitle = '';
                 let comment = '';
                 
-                // 如果有《》包裹的标题
                 const titleMatch = title.match(/《([^》]+)》/);
                 if (titleMatch) {
                     videoTitle = titleMatch[1];
                     comment = title.replace(titleMatch[0], '').trim();
                 } else {
-                    // 否则整个标题作为评论
                     comment = title;
                     videoTitle = '';
                 }
@@ -437,7 +405,6 @@ JSON.stringify(result);
         return null;
     }
 
-    // 预览待同步的提醒事项
     async previewSyncReminders() {
         new Notice('正在读取提醒事项...');
         
@@ -447,7 +414,6 @@ JSON.stringify(result);
             return;
         }
 
-        // 筛选出包含记账标签的提醒
         const accountingReminders = reminders
             .map(reminder => {
                 const entry = this.parseReminderTitle(reminder.title);
@@ -467,7 +433,6 @@ JSON.stringify(result);
             return;
         }
 
-        // 显示预览信息
         let message = `找到 ${accountingReminders.length} 条待同步的记账提醒：\n\n`;
         accountingReminders.forEach(({ reminder, entry }) => {
             message += `📅 ${entry.date}\n`;
@@ -483,214 +448,316 @@ JSON.stringify(result);
     }
 
     /**
-     * 同步提醒事项到日记（公开接口，带锁）
+     * 执行完整的双向同步（内部使用）
+     * 顺序执行：1. 提醒→日记  2. 日记→提醒
+     */
+    private async performFullSync(silent = false): Promise<void> {
+        await this.withSyncLock('performFullSync', async () => {
+            // 步骤1：同步提醒事项到日记
+            console.log('[ReminderSync] 📥 步骤1: 同步提醒事项到日记');
+            await this.syncRemindersToJournalInternal(silent);
+            
+            // 等待500ms，让提醒事项系统更新
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // 步骤2：同步日记到提醒事项
+            console.log('[ReminderSync] 📤 步骤2: 同步日记到提醒事项');
+            await this.syncJournalsToRemindersInternal(silent);
+        });
+    }
+
+    /**
+     * 同步提醒事项到日记（公开接口）
      */
     async syncRemindersToJournal(silent = false) {
         console.log('[ReminderSync] syncRemindersToJournal 被调用');
         
-        // 检查锁
-        if (this.syncLock) {
-            console.log('[ReminderSync] ❌ 同步锁已被占用，跳过提醒到日记同步');
-            if (!silent) {
-                new Notice('同步正在进行中，请稍候...');
-            }
-            return;
-        }
+        const result = await this.withSyncLock(
+            'syncRemindersToJournal',
+            () => this.syncRemindersToJournalInternal(silent),
+            silent // 静默模式跳过，手动触发时排队等待
+        );
         
-        // 加锁
-        console.log('[ReminderSync] 🔒 获取同步锁 (syncRemindersToJournal)');
-        this.syncLock = true;
-        
-        try {
-            await this.syncRemindersToJournalInternal(silent);
-        } finally {
-            // 释放锁
-            console.log('[ReminderSync] � 释放同步锁 (syncRemindersToJournal)');
-            this.syncLock = false;
+        if (result === null && !silent) {
+            new Notice('同步正在进行中，请稍候...');
         }
     }
 
     /**
-     * 同步提醒事项到日记（内部实现，不加锁）
-     * 从 macOS 提醒事项中读取已完成的记账/打卡/视频提醒，写入到对应日期的日记文件中，并删除提醒
-     * 
-     * @param silent 是否静默执行（不显示通知）
+     * 同步日记任务到提醒事项（公开接口）
      */
-    private async syncRemindersToJournalInternal(silent = false): Promise<void> {
-        try {
-            if (!silent) {
-                new Notice('开始同步提醒事项...');
-            }
-            
-            // 获取锁后立即刷新提醒列表（上一个操作可能修改了列表）
-            console.log('[ReminderSync] 🔄 获取锁后刷新提醒列表');
-            const reminders = await this.getReminders();
-            if (reminders.length === 0) {
-                if (!silent) {
-                    new Notice('未找到提醒事项');
-                }
-                return; // finally 会释放锁
-            }
-
-            // 筛选并解析记账提醒、打卡提醒和视频提醒
-            const accountingEntries: Array<{ reminder: Reminder; entry: AccountingEntry }> = [];
-            const habitEntries: Array<{ reminder: Reminder; entry: HabitEntry }> = [];
-            const videoEntries: Array<{ reminder: Reminder; entry: VideoEntry }> = [];
-            
-            for (const reminder of reminders) {
-                // 先尝试解析为记账提醒（包含数字）
-                const accountingEntry = this.parseReminderTitle(reminder.title);
-                if (accountingEntry) {
-                    accountingEntry.date = reminder.due 
-                        ? formatLocalDate(new Date(reminder.due))
-                        : formatLocalDate(new Date());
-                    accountingEntry.reminderId = reminder.id;
-                    accountingEntries.push({ reminder, entry: accountingEntry });
-                    continue;
-                }
-                
-                // 再尝试解析为视频提醒
-                const videoEntry = this.parseVideoReminder(reminder.title);
-                if (videoEntry) {
-                    videoEntry.date = reminder.due 
-                        ? formatLocalDate(new Date(reminder.due))
-                        : formatLocalDate(new Date());
-                    videoEntry.reminderId = reminder.id;
-                    videoEntries.push({ reminder, entry: videoEntry });
-                    continue;
-                }
-                
-                // 最后尝试解析为打卡提醒
-                const habitEntry = this.parseHabitReminder(reminder.title);
-                if (habitEntry) {
-                    habitEntry.date = reminder.due 
-                        ? formatLocalDate(new Date(reminder.due))
-                        : formatLocalDate(new Date());
-                    habitEntry.reminderId = reminder.id;
-                    habitEntries.push({ reminder, entry: habitEntry });
-                }
-            }
-
-            if (accountingEntries.length === 0 && habitEntries.length === 0 && videoEntries.length === 0) {
-                if (!silent) {
-                    new Notice('未找到记账、打卡或视频提醒');
-                }
-                return; // finally 会释放锁
-            }
-
-            let syncCount = 0;
-            const deletedReminders: string[] = [];
-            
-            // 同步记账提醒
-            if (accountingEntries.length > 0) {
-                const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: AccountingEntry }>> = {};
-                for (const item of accountingEntries) {
-                    const date = item.entry.date;
-                    if (!entriesByDate[date]) {
-                        entriesByDate[date] = [];
-                    }
-                    entriesByDate[date].push(item);
-                }
-
-                for (const [date, items] of Object.entries(entriesByDate)) {
-                    const entries = items.map(item => item.entry);
-                    const success = await this.syncAccountingToJournal(date, entries);
-                    
-                    if (success) {
-                        syncCount += entries.length;
-                        
-                        for (const item of items) {
-                            const deleted = await this.deleteReminder(item.reminder.id);
-                            if (deleted) {
-                                deletedReminders.push(item.reminder.title);
-                                console.log(`[ReminderSync] 已删除记账提醒: ${item.reminder.title}`);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // 同步打卡提醒
-            if (habitEntries.length > 0) {
-                const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: HabitEntry }>> = {};
-                for (const item of habitEntries) {
-                    const date = item.entry.date;
-                    if (!entriesByDate[date]) {
-                        entriesByDate[date] = [];
-                    }
-                    entriesByDate[date].push(item);
-                }
-
-                for (const [date, items] of Object.entries(entriesByDate)) {
-                    const entries = items.map(item => item.entry);
-                    const success = await this.syncHabitsToJournal(date, entries);
-                    
-                    if (success) {
-                        syncCount += entries.length;
-                        
-                        for (const item of items) {
-                            const deleted = await this.deleteReminder(item.reminder.id);
-                            if (deleted) {
-                                deletedReminders.push(item.reminder.title);
-                                console.log(`[ReminderSync] 已删除打卡提醒: ${item.reminder.title}`);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // 同步视频提醒
-            if (videoEntries.length > 0) {
-                const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: VideoEntry }>> = {};
-                for (const item of videoEntries) {
-                    const date = item.entry.date;
-                    if (!entriesByDate[date]) {
-                        entriesByDate[date] = [];
-                    }
-                    entriesByDate[date].push(item);
-                }
-
-                for (const [date, items] of Object.entries(entriesByDate)) {
-                    const entries = items.map(item => item.entry);
-                    const success = await this.syncVideosToJournal(date, entries);
-                    
-                    if (success) {
-                        syncCount += entries.length;
-                        
-                        for (const item of items) {
-                            const deleted = await this.deleteReminder(item.reminder.id);
-                            if (deleted) {
-                                deletedReminders.push(item.reminder.title);
-                                console.log(`[ReminderSync] 已删除视频提醒: ${item.reminder.title}`);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!silent) {
-                new Notice(`同步完成！共同步 ${syncCount} 条记录，删除 ${deletedReminders.length} 条提醒`);
-            }
-            
-            console.log(`[ReminderSync] 同步完成: ${syncCount} 条记录，删除 ${deletedReminders.length} 条提醒`);
+    async syncJournalsToReminders(silent = false): Promise<void> {
+        console.log('[ReminderSync] syncJournalsToReminders 被调用');
         
-        } catch (error) {
-            console.error('[ReminderSync] 提醒到日记同步失败:', error);
-            if (!silent) {
-                new Notice('同步失败，请查看控制台');
-            }
-            throw error; // 重新抛出错误，让调用者知道
+        const result = await this.withSyncLock(
+            'syncJournalsToReminders',
+            () => this.syncJournalsToRemindersInternal(silent),
+            silent
+        );
+        
+        if (result === null && !silent) {
+            new Notice('同步正在进行中，请稍候...');
         }
     }
 
-    // 删除提醒事项
+    /**
+     * 同步提醒事项到日记（内部实现）
+     */
+    private async syncRemindersToJournalInternal(silent = false): Promise<void> {
+        if (!silent) {
+            new Notice('开始同步提醒事项...');
+        }
+        
+        console.log('[ReminderSync] 🔄 刷新提醒列表');
+        const reminders = await this.getReminders();
+        if (reminders.length === 0) {
+            if (!silent) {
+                new Notice('未找到提醒事项');
+            }
+            return;
+        }
+
+        const accountingEntries: Array<{ reminder: Reminder; entry: AccountingEntry }> = [];
+        const habitEntries: Array<{ reminder: Reminder; entry: HabitEntry }> = [];
+        const videoEntries: Array<{ reminder: Reminder; entry: VideoEntry }> = [];
+        
+        for (const reminder of reminders) {
+            const accountingEntry = this.parseReminderTitle(reminder.title);
+            if (accountingEntry) {
+                accountingEntry.date = reminder.due 
+                    ? formatLocalDate(new Date(reminder.due))
+                    : formatLocalDate(new Date());
+                accountingEntry.reminderId = reminder.id;
+                accountingEntries.push({ reminder, entry: accountingEntry });
+                continue;
+            }
+            
+            const videoEntry = this.parseVideoReminder(reminder.title);
+            if (videoEntry) {
+                videoEntry.date = reminder.due 
+                    ? formatLocalDate(new Date(reminder.due))
+                    : formatLocalDate(new Date());
+                videoEntry.reminderId = reminder.id;
+                videoEntries.push({ reminder, entry: videoEntry });
+                continue;
+            }
+            
+            const habitEntry = this.parseHabitReminder(reminder.title);
+            if (habitEntry) {
+                habitEntry.date = reminder.due 
+                    ? formatLocalDate(new Date(reminder.due))
+                    : formatLocalDate(new Date());
+                habitEntry.reminderId = reminder.id;
+                habitEntries.push({ reminder, entry: habitEntry });
+            }
+        }
+
+        if (accountingEntries.length === 0 && habitEntries.length === 0 && videoEntries.length === 0) {
+            if (!silent) {
+                new Notice('未找到记账、打卡或视频提醒');
+            }
+            return;
+        }
+
+        let syncCount = 0;
+        const deletedReminders: string[] = [];
+        
+        // 同步记账提醒
+        if (accountingEntries.length > 0) {
+            const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: AccountingEntry }>> = {};
+            for (const item of accountingEntries) {
+                const date = item.entry.date;
+                if (!entriesByDate[date]) {
+                    entriesByDate[date] = [];
+                }
+                entriesByDate[date].push(item);
+            }
+
+            for (const [date, items] of Object.entries(entriesByDate)) {
+                const entries = items.map(item => item.entry);
+                const success = await this.syncAccountingToJournal(date, entries);
+                
+                if (success) {
+                    syncCount += entries.length;
+                    for (const item of items) {
+                        const deleted = await this.deleteReminder(item.reminder.id);
+                        if (deleted) {
+                            deletedReminders.push(item.reminder.title);
+                            console.log(`[ReminderSync] 已删除记账提醒: ${item.reminder.title}`);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 同步打卡提醒
+        if (habitEntries.length > 0) {
+            const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: HabitEntry }>> = {};
+            for (const item of habitEntries) {
+                const date = item.entry.date;
+                if (!entriesByDate[date]) {
+                    entriesByDate[date] = [];
+                }
+                entriesByDate[date].push(item);
+            }
+
+            for (const [date, items] of Object.entries(entriesByDate)) {
+                const entries = items.map(item => item.entry);
+                const success = await this.syncHabitsToJournal(date, entries);
+                
+                if (success) {
+                    syncCount += entries.length;
+                    for (const item of items) {
+                        const deleted = await this.deleteReminder(item.reminder.id);
+                        if (deleted) {
+                            deletedReminders.push(item.reminder.title);
+                            console.log(`[ReminderSync] 已删除打卡提醒: ${item.reminder.title}`);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 同步视频提醒
+        if (videoEntries.length > 0) {
+            const entriesByDate: Record<string, Array<{ reminder: Reminder; entry: VideoEntry }>> = {};
+            for (const item of videoEntries) {
+                const date = item.entry.date;
+                if (!entriesByDate[date]) {
+                    entriesByDate[date] = [];
+                }
+                entriesByDate[date].push(item);
+            }
+
+            for (const [date, items] of Object.entries(entriesByDate)) {
+                const entries = items.map(item => item.entry);
+                const success = await this.syncVideosToJournal(date, entries);
+                
+                if (success) {
+                    syncCount += entries.length;
+                    for (const item of items) {
+                        const deleted = await this.deleteReminder(item.reminder.id);
+                        if (deleted) {
+                            deletedReminders.push(item.reminder.title);
+                            console.log(`[ReminderSync] 已删除视频提醒: ${item.reminder.title}`);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!silent) {
+            new Notice(`同步完成！共同步 ${syncCount} 条记录，删除 ${deletedReminders.length} 条提醒`);
+        }
+        
+        console.log(`[ReminderSync] 同步完成: ${syncCount} 条记录，删除 ${deletedReminders.length} 条提醒`);
+    }
+
+    /**
+     * 同步日记任务到提醒事项（内部实现）
+     */
+    private async syncJournalsToRemindersInternal(silent = false): Promise<void> {
+        if (!silent) {
+            new Notice('开始同步日记任务到提醒事项...');
+        }
+
+        const { vault } = this.app;
+        const journalsPath = this.config.journalsPath;
+        const journalFiles = vault.getMarkdownFiles().filter(file => 
+            file.path.startsWith(journalsPath)
+        );
+
+        let createdCount = 0;
+
+        for (const file of journalFiles) {
+            const content = await vault.read(file);
+            const lines = content.split('\n');
+
+            for (const line of lines) {
+                const taskMatch = line.match(/^-\s+(?:\[([x\sX])\]|TODO|DONE)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+                
+                if (taskMatch) {
+                    const [, checkboxStatus, taskTitle, date, hours, minutes] = taskMatch;
+                    const isCompleted = checkboxStatus === 'x' || checkboxStatus === 'X' || line.includes('DONE');
+                    
+                    const taskDate = new Date(date);
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    
+                    if (taskDate < today) {
+                        continue;
+                    }
+                    
+                    let finalTaskTitle = taskTitle;
+                    let finalHours = hours;
+                    let finalMinutes = minutes;
+                    
+                    const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
+                    if (timeInTitle && !hours) {
+                        finalHours = timeInTitle[1];
+                        finalMinutes = timeInTitle[2];
+                        finalTaskTitle = timeInTitle[3];
+                    }
+                    
+                    let dueDate: string;
+                    if (finalHours && finalMinutes) {
+                        dueDate = `${date}T${finalHours}:${finalMinutes}:00`;
+                    } else {
+                        const now = new Date();
+                        const taskDateObj = new Date(date);
+                        
+                        const isToday = taskDateObj.getFullYear() === now.getFullYear() &&
+                                      taskDateObj.getMonth() === now.getMonth() &&
+                                      taskDateObj.getDate() === now.getDate();
+                        
+                        if (isToday && now.getHours() >= 9) {
+                            const futureTime = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+                            const h = String(futureTime.getHours()).padStart(2, '0');
+                            const m = String(futureTime.getMinutes()).padStart(2, '0');
+                            dueDate = `${date}T${h}:${m}:00`;
+                        } else {
+                            dueDate = `${date}T09:00:00`;
+                        }
+                    }
+
+                    const existingReminders = await this.getReminders();
+                    const existingReminder = existingReminders.find(r => {
+                        const reminderTitle = r.title.trim();
+                        const taskTitleTrimmed = finalTaskTitle.trim();
+                        if (reminderTitle !== taskTitleTrimmed) return false;
+                        if (!r.due) return false;
+                        const reminderDate = r.due.split('T')[0];
+                        return reminderDate === date;
+                    });
+
+                    if (existingReminder) {
+                        if (isCompleted) {
+                            await this.completeReminder(existingReminder.id);
+                            console.log(`[ReminderSync] 标记提醒为完成: ${finalTaskTitle}`);
+                        } else {
+                            console.log(`[ReminderSync] ✅ 跳过已存在的提醒: ${finalTaskTitle} @${date}`);
+                        }
+                    } else if (!isCompleted) {
+                        console.log(`[ReminderSync] ➕ 创建提醒: ${finalTaskTitle} @${date}${finalHours ? ' ' + finalHours + ':' + finalMinutes : ''}`);
+                        await this.createReminder(finalTaskTitle.trim(), dueDate);
+                        createdCount++;
+                    }
+                }
+            }
+        }
+
+        if (!silent) {
+            new Notice(`同步完成！创建 ${createdCount} 个提醒`);
+        }
+        console.log(`[ReminderSync] 日记到提醒同步完成: 创建 ${createdCount} 个提醒`);
+    }
+
     async deleteReminder(id: string): Promise<boolean> {
         const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.delete();'ok';`;
         const result = await this.runJXA(script);
         return result !== null;
     }
 
-    // 创建提醒事项
     async createReminder(title: string, dueDate: string): Promise<boolean> {
         const script = `
 var Reminders=Application('Reminders');
@@ -703,41 +770,33 @@ list.reminders.push(r);
         return result !== null;
     }
 
-    // 标记提醒为完成
     async completeReminder(id: string): Promise<boolean> {
         const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.completed=true;'ok';`;
         const result = await this.runJXA(script);
         return result !== null;
     }
 
-    // 防抖同步文件（避免短时间内重复同步同一文件）
+    /**
+     * 防抖同步文件
+     */
     private debounceSyncFile(file: TFile) {
         const filePath = file.path;
         console.log(`[ReminderSync] debounceSyncFile 被调用: ${filePath}`);
         
-        // 如果全局同步正在进行，直接跳过（全局同步会包含所有文件）
         if (this.globalSyncing) {
             console.log(`[ReminderSync] ⏭️ 全局同步进行中，跳过单文件同步: ${filePath}`);
             return;
         }
         
-        // 清除之前的定时器
         const existingTimer = this.syncDebounceTimers.get(filePath);
         if (existingTimer) {
             console.log(`[ReminderSync] 清除之前的防抖定时器: ${filePath}`);
             window.clearTimeout(existingTimer);
         }
         
-        // 设置新的定时器，3000ms 后执行同步
         console.log(`[ReminderSync] ⏱️ 设置 3 秒防抖定时器: ${filePath}`);
         const timer = window.setTimeout(async () => {
             this.syncDebounceTimers.delete(filePath);
-            
-            // 检查锁
-            if (this.syncLock) {
-                console.log(`[ReminderSync] ❌ 同步锁已被占用，跳过: ${filePath}`);
-                return;
-            }
             
             console.log(`[ReminderSync] ⏰ 防抖定时器触发，开始双向同步: ${filePath}`);
             
@@ -759,425 +818,186 @@ list.reminders.push(r);
 
     /**
      * 文件与提醒事项的双向同步
-     * 在一把锁内顺序执行：1. 提醒→日记  2. 日记→提醒
-     * 
-     * @param file 要同步的文件
-     * @param content 文件内容
      */
     async syncFileWithReminders(file: TFile, content: string): Promise<void> {
         console.log(`[ReminderSync] syncFileWithReminders 被调用: ${file.path}`);
         
-        // 加锁
-        console.log('[ReminderSync] 🔒 获取同步锁 (syncFileWithReminders)');
-        this.syncLock = true;
-        
-        try {
-            // 第一步：同步提醒事项到日记（静默执行）
+        await this.withSyncLock('syncFileWithReminders', async () => {
+            // 步骤1：同步提醒事项到日记
             console.log('[ReminderSync] 📥 步骤1: 同步提醒事项到日记');
             await this.syncRemindersToJournalInternal(true);
             
-            // 第二步：同步当前文件到提醒事项
+            // 步骤2：同步当前文件到提醒事项
             console.log('[ReminderSync] 📤 步骤2: 同步日记到提醒事项');
             await this.syncCurrentFileToRemindersInternal(file, content);
             
             console.log(`[ReminderSync] ✅ 双向同步完成: ${file.path}`);
-            
-        } catch (error) {
-            console.error('[ReminderSync] 双向同步失败:', error);
-        } finally {
-            // 释放锁
-            console.log('[ReminderSync] 🔓 释放同步锁 (syncFileWithReminders)');
-            this.syncLock = false;
-        }
+        }, true); // skipIfBusy=true，如果锁被占用则跳过
     }
 
     /**
-     * 同步当前文件的任务到提醒事项（公开接口，带锁）
-     */
-    async syncCurrentFileToReminders(file: TFile, content: string): Promise<void> {
-        console.log(`[ReminderSync] syncCurrentFileToReminders 被调用: ${file.path}`);
-        
-        // 加锁
-        console.log('[ReminderSync] 🔒 获取同步锁 (syncCurrentFileToReminders)');
-        this.syncLock = true;
-        
-        try {
-            await this.syncCurrentFileToRemindersInternal(file, content);
-        } finally {
-            // 释放锁
-            console.log('[ReminderSync] � 释放同步锁 (syncCurrentFileToReminders)');
-            this.syncLock = false;
-        }
-    }
-
-    /**
-     * 同步当前文件的任务到提醒事项（内部实现，不加锁）
-     * 读取文件中带有 @日期 格式的任务，创建或更新对应的提醒事项
-     * 
-     * @param file 要同步的文件
-     * @param content 文件内容
+     * 同步当前文件的任务到提醒事项（内部实现）
      */
     private async syncCurrentFileToRemindersInternal(file: TFile, content: string): Promise<void> {
+        const lines = content.split('\n');
+        let hasTask = false;
+        let createdCount = 0;
+        let completedCount = 0;
         
-        try {
-            const lines = content.split('\n');
-            let hasTask = false;
-            let createdCount = 0;
-            let completedCount = 0;
+        for (const line of lines) {
+            const taskMatch = line.match(/^-\s+(?:\[([x\sX])\]|TODO|DONE)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
             
-            // 注意：不在这里获取提醒列表，而是在每次判断前实时获取，确保数据最新
-            
-            for (const line of lines) {
-                // 匹配带有日期的任务
-                const taskMatch = line.match(/^-\s+(?:\[([x\sX])\]|TODO|DONE)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+            if (taskMatch) {
+                hasTask = true;
+                const [, checkboxStatus, taskTitle, date, hours, minutes] = taskMatch;
+                const isCompleted = checkboxStatus === 'x' || checkboxStatus === 'X' || line.includes('DONE');
                 
-                if (taskMatch) {
-                    hasTask = true;
-                    const [, checkboxStatus, taskTitle, date, hours, minutes] = taskMatch;
+                const taskDate = new Date(date);
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                
+                if (taskDate < today) {
+                    continue;
+                }
+                
+                let finalTaskTitle = taskTitle;
+                let finalHours = hours;
+                let finalMinutes = minutes;
+                
+                const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
+                if (timeInTitle && !hours) {
+                    finalHours = timeInTitle[1];
+                    finalMinutes = timeInTitle[2];
+                    finalTaskTitle = timeInTitle[3];
+                }
+                
+                let dueDate: string;
+                if (finalHours && finalMinutes) {
+                    dueDate = `${date}T${finalHours}:${finalMinutes}:00`;
+                } else {
+                    const now = new Date();
+                    const taskDateObj = new Date(date);
                     
-                    // 检查任务是否已完成
-                    const isCompleted = checkboxStatus === 'x' || checkboxStatus === 'X' || line.includes('DONE');
+                    const isToday = taskDateObj.getFullYear() === now.getFullYear() &&
+                                  taskDateObj.getMonth() === now.getMonth() &&
+                                  taskDateObj.getDate() === now.getDate();
                     
-                    // 检查日期是否有效（不是过去的日期）
-                    const taskDate = new Date(date);
-                    const today = new Date();
-                    today.setHours(0, 0, 0, 0);
-                    
-                    if (taskDate < today) {
-                        continue; // 跳过过期任务
-                    }
-                    
-                    let finalTaskTitle = taskTitle;
-                    let finalHours = hours;
-                    let finalMinutes = minutes;
-                    
-                    // 如果任务标题开头是时间格式，提取时间
-                    const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
-                    if (timeInTitle && !hours) {
-                        finalHours = timeInTitle[1];
-                        finalMinutes = timeInTitle[2];
-                        finalTaskTitle = timeInTitle[3];
-                    }
-                    
-                    // 构建 ISO 格式的日期时间
-                    let dueDate: string;
-                    if (finalHours && finalMinutes) {
-                        dueDate = `${date}T${finalHours}:${finalMinutes}:00`;
+                    if (isToday && now.getHours() >= 9) {
+                        const futureTime = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+                        const h = String(futureTime.getHours()).padStart(2, '0');
+                        const m = String(futureTime.getMinutes()).padStart(2, '0');
+                        dueDate = `${date}T${h}:${m}:00`;
                     } else {
-                        const now = new Date();
-                        const taskDateObj = new Date(date);
-                        
-                        const isToday = taskDateObj.getFullYear() === now.getFullYear() &&
-                                      taskDateObj.getMonth() === now.getMonth() &&
-                                      taskDateObj.getDate() === now.getDate();
-                        
-                        if (isToday && now.getHours() >= 9) {
-                            const futureTime = new Date(now.getTime() + 3 * 60 * 60 * 1000);
-                            const hours = String(futureTime.getHours()).padStart(2, '0');
-                            const minutes = String(futureTime.getMinutes()).padStart(2, '0');
-                            dueDate = `${date}T${hours}:${minutes}:00`;
-                        } else {
-                            dueDate = `${date}T09:00:00`;
-                        }
+                        dueDate = `${date}T09:00:00`;
                     }
+                }
+                
+                const existingReminders = await this.getReminders();
+                const existingReminder = existingReminders.find(r => {
+                    const reminderTitle = r.title.trim();
+                    const taskTitleTrimmed = finalTaskTitle.trim();
+                    if (reminderTitle !== taskTitleTrimmed) return false;
+                    if (!r.due) return false;
+                    const reminderDate = r.due.split('T')[0];
+                    const isMatch = reminderDate === date;
                     
-                    // 每次判断前重新获取提醒列表（确保实时性）
-                    const existingReminders = await this.getReminders();
+                    console.log(`[ReminderSync] 比较提醒: "${reminderTitle}"`);
+                    console.log(`  - 提醒日期: ${reminderDate} (原始: ${r.due})`);
+                    console.log(`  - 任务日期: ${date}`);
+                    console.log(`  - 匹配结果: ${isMatch}`);
                     
-                    // 检查提醒是否已存在（标题和日期yyyy-mm-dd都要匹配）
-                    const existingReminder = existingReminders.find(r => {
-                        // 标题匹配（忽略首尾空格）
-                        const reminderTitle = r.title.trim();
-                        const taskTitleTrimmed = finalTaskTitle.trim();
-                        if (reminderTitle !== taskTitleTrimmed) return false;
+                    return isMatch;
+                });
+                
+                if (existingReminder) {
+                    if (isCompleted) {
+                        await this.completeReminder(existingReminder.id);
+                        completedCount++;
+                        console.log(`[ReminderSync] 标记提醒为完成: ${finalTaskTitle}`);
+                    } else {
+                        console.log(`[ReminderSync] ✅ 跳过已存在的提醒: ${finalTaskTitle} @${date}`);
+                    }
+                } else if (!isCompleted) {
+                    console.log(`[ReminderSync] ➕ 创建提醒: ${finalTaskTitle} @${date}`);
+                    await this.createReminder(finalTaskTitle.trim(), dueDate);
+                    createdCount++;
+                }
+            }
+        }
+        
+        if (hasTask) {
+            console.log(`[ReminderSync] 已同步文件: ${file.path}`);
+            
+            // 反向同步：将提醒事项中已完成的任务标记到笔记中
+            let markedDoneCount = 0;
+            const allReminders = await this.getReminders();
+            const completedReminders = allReminders.filter(r => r.completed);
+            
+            if (completedReminders.length > 0) {
+                let updatedContent = content;
+                let contentChanged = false;
+                
+                for (const reminder of completedReminders) {
+                    if (!reminder.due) continue;
+                    
+                    const reminderDate = reminder.due.split('T')[0];
+                    const reminderTitle = reminder.title;
+                    
+                    const taskPattern = new RegExp(
+                        `^(-\\s+(?:\\[\\s\\]|TODO))\\s+(.+?)\\s+@${reminderDate.replace(/[-]/g, '\\-')}(?:\\s+\\d{2}:\\d{2})?$`,
+                        'gm'
+                    );
+                    
+                    updatedContent = updatedContent.replace(taskPattern, (match, prefix, taskTitle) => {
+                        let cleanTitle = taskTitle.trim();
+                        const timeMatch = cleanTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
+                        if (timeMatch) {
+                            cleanTitle = timeMatch[3];
+                        }
                         
-                        // 日期匹配（只比较yyyy-mm-dd部分）
-                        if (!r.due) return false;
-                        const reminderDate = r.due.split('T')[0]; // 提取 yyyy-mm-dd
-                        const isMatch = reminderDate === date;
-                        
-                        // 详细调试日志
-                        console.log(`[ReminderSync] 比较提醒: "${reminderTitle}"`);
-                        console.log(`  - 提醒日期: ${reminderDate} (原始: ${r.due})`);
-                        console.log(`  - 任务日期: ${date}`);
-                        console.log(`  - 匹配结果: ${isMatch}`);
-                        
-                        return isMatch;
+                        if (cleanTitle === reminderTitle) {
+                            contentChanged = true;
+                            markedDoneCount++;
+                            return match.replace(/^-\s+(?:\[\s\]|TODO)/, '- DONE');
+                        }
+                        return match;
                     });
-                    
-                    if (existingReminder) {
-                        if (isCompleted) {
-                            await this.completeReminder(existingReminder.id);
-                            completedCount++;
-                            console.log(`[ReminderSync] 标记提醒为完成: ${finalTaskTitle}`);
-                        } else {
-                            console.log(`[ReminderSync] ✅ 跳过已存在的提醒: ${finalTaskTitle} @${date}`);
-                        }
-                    } else if (!isCompleted) {
-                        console.log(`[ReminderSync] ➕ 创建提醒: ${finalTaskTitle} @${date}`);
-                        await this.createReminder(finalTaskTitle.trim(), dueDate);
-                        createdCount++;
-                    }
+                }
+                
+                if (contentChanged) {
+                    await this.app.vault.modify(file, updatedContent);
+                    console.log(`[ReminderSync] 标记 ${markedDoneCount} 个任务为已完成`);
                 }
             }
             
-            if (hasTask) {
-                console.log(`[ReminderSync] 已同步文件: ${file.path}`);
-                
-                // 反向同步：将提醒事项中已完成的任务标记到笔记中
-                let markedDoneCount = 0;
-                
-                // 重新获取提醒列表，用于反向同步
-                const allReminders = await this.getReminders();
-                const completedReminders = allReminders.filter(r => r.completed);
-                
-                if (completedReminders.length > 0) {
-                    let updatedContent = content;
-                    let contentChanged = false;
-                    
-                    for (const reminder of completedReminders) {
-                        if (!reminder.due) continue;
-                        
-                        const reminderDate = reminder.due.split('T')[0];
-                        const reminderTitle = reminder.title;
-                        
-                        // 查找笔记中对应的未完成任务
-                        const taskPattern = new RegExp(
-                            `^(-\\s+(?:\\[\\s\\]|TODO))\\s+(.+?)\\s+@${reminderDate.replace(/[-]/g, '\\-')}(?:\\s+\\d{2}:\\d{2})?$`,
-                            'gm'
-                        );
-                        
-                        updatedContent = updatedContent.replace(taskPattern, (match, prefix, taskTitle) => {
-                            // 提取任务标题（可能包含时间前缀）
-                            let cleanTitle = taskTitle.trim();
-                            const timeMatch = cleanTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
-                            if (timeMatch) {
-                                cleanTitle = timeMatch[3];
-                            }
-                            
-                            // 检查标题是否匹配
-                            if (cleanTitle === reminderTitle) {
-                                contentChanged = true;
-                                markedDoneCount++;
-                                // 将任务标记为已完成
-                                return match.replace(/^-\s+(?:\[\s\]|TODO)/, '- DONE');
-                            }
-                            return match;
-                        });
-                    }
-                    
-                    // 如果内容有变化，保存文件
-                    if (contentChanged) {
-                        await this.app.vault.modify(file, updatedContent);
-                        console.log(`[ReminderSync] 标记 ${markedDoneCount} 个任务为已完成`);
-                    }
+            if (this.config.notifyOnSync && (createdCount > 0 || completedCount > 0 || markedDoneCount > 0)) {
+                let message = '';
+                if (createdCount > 0) {
+                    message += `创建 ${createdCount} 个提醒`;
                 }
-                
-                // 如果配置了显示通知，且有变更
-                if (this.config.notifyOnSync && (createdCount > 0 || completedCount > 0 || markedDoneCount > 0)) {
-                    let message = '';
-                    if (createdCount > 0) {
-                        message += `创建 ${createdCount} 个提醒`;
-                    }
-                    if (completedCount > 0) {
-                        if (message) message += '，';
-                        message += `完成 ${completedCount} 个提醒`;
-                    }
-                    if (markedDoneCount > 0) {
-                        if (message) message += '，';
-                        message += `标记 ${markedDoneCount} 个任务为完成`;
-                    }
-                    new Notice(`同步完成：${message}`);
+                if (completedCount > 0) {
+                    if (message) message += '，';
+                    message += `完成 ${completedCount} 个提醒`;
                 }
+                if (markedDoneCount > 0) {
+                    if (message) message += '，';
+                    message += `标记 ${markedDoneCount} 个任务为完成`;
+                }
+                new Notice(`同步完成：${message}`);
             }
-        } catch (error) {
-            console.error('[ReminderSync] 同步当前文件失败:', error);
-            throw error; // 重新抛出错误，让调用者知道
         }
     }
 
-    /**
-     * 同步日记中的任务到提醒事项
-     * 扫描所有日记文件，读取带有 @日期 格式的任务，创建或更新对应的提醒事项
-     * 
-     * @param silent 是否静默执行（不显示通知）
-     * 
-     * 注意：
-     * - 使用 syncLock 互斥锁，确保不会与其他同步操作并发
-     * - 每次判断前会重新获取提醒列表，避免重复创建
-     * - 必须在 finally 块中释放锁
-     */
-    async syncJournalsToReminders(silent = false): Promise<void> {
-        console.log('[ReminderSync] syncJournalsToReminders 被调用');
-        
-        // 检查锁
-        if (this.syncLock) {
-            console.log('[ReminderSync] ❌ 同步锁已被占用，跳过日记到提醒同步');
-            if (!silent) {
-                new Notice('同步正在进行中，请稍候...');
-            }
-            return;
-        }
-        
-        // 加锁
-        console.log('[ReminderSync] 🔒 获取同步锁 (syncJournalsToReminders)');
-        this.syncLock = true;
-        
-        // 获取锁后立即刷新提醒列表（上一个操作可能修改了列表）
-        // 注意：这里不获取，而是在每次判断前实时获取，确保最新
-        console.log('[ReminderSync] 💡 将在每次判断前实时获取提醒列表');
-        
-        try {
-            if (!silent) {
-                new Notice('开始同步日记任务到提醒事项...');
-            }
-
-            const { vault } = this.app;
-            const journalsPath = this.config.journalsPath;
-
-            // 获取所有日记文件
-            const journalFiles = vault.getMarkdownFiles().filter(file => 
-                file.path.startsWith(journalsPath)
-            );
-
-            let createdCount = 0;
-
-            for (const file of journalFiles) {
-                const content = await vault.read(file);
-                const lines = content.split('\n');
-
-                for (const line of lines) {
-                    // 匹配带有日期的任务，支持多种格式：
-                    // - [ ] 任务 @2026-01-16
-                    // - [x] 任务 @2026-01-16（已完成）
-                    // - TODO 任务 @2026-01-16
-                    // - DONE 任务 @2026-01-16（已完成）
-                    // - TODO 11:45 任务 @2026-01-16
-                    const taskMatch = line.match(/^-\s+(?:\[([x\sX])\]|TODO|DONE)\s+(.+?)\s+@(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}):(\d{2}))?/);
-                    
-                    if (taskMatch) {
-                        const [, checkboxStatus, taskTitle, date, hours, minutes] = taskMatch;
-                        
-                        // 检查任务是否已完成
-                        const isCompleted = checkboxStatus === 'x' || checkboxStatus === 'X' || line.includes('DONE');
-                        
-                        // 检查日期是否有效（不是过去的日期）
-                        const taskDate = new Date(date);
-                        const today = new Date();
-                        today.setHours(0, 0, 0, 0); // 重置到当天0点
-                        
-                        if (taskDate < today) {
-                            // 跳过过期任务
-                            continue;
-                        }
-                        
-                        let finalTaskTitle = taskTitle;
-                        let finalHours = hours;
-                        let finalMinutes = minutes;
-                        
-                        // 如果任务标题开头是时间格式（如 "11:45 任务内容"），提取时间
-                        const timeInTitle = taskTitle.match(/^(\d{2}):(\d{2})\s+(.+)/);
-                        if (timeInTitle && !hours) {
-                            finalHours = timeInTitle[1];
-                            finalMinutes = timeInTitle[2];
-                            finalTaskTitle = timeInTitle[3];
-                        }
-                        
-                        // 构建 ISO 格式的日期时间
-                        let dueDate: string;
-                        if (finalHours && finalMinutes) {
-                            // 包含时间：2026-01-16T10:00:00
-                            dueDate = `${date}T${finalHours}:${finalMinutes}:00`;
-                        } else {
-                            // 只有日期，需要智能设置时间
-                            const now = new Date();
-                            const taskDateObj = new Date(date);
-                            
-                            // 检查是否是今天
-                            const isToday = taskDateObj.getFullYear() === now.getFullYear() &&
-                                          taskDateObj.getMonth() === now.getMonth() &&
-                                          taskDateObj.getDate() === now.getDate();
-                            
-                            if (isToday && now.getHours() >= 9) {
-                                // 今天且已经过了早上9点，设置为当前时间+3小时
-                                const futureTime = new Date(now.getTime() + 3 * 60 * 60 * 1000);
-                                const hours = String(futureTime.getHours()).padStart(2, '0');
-                                const minutes = String(futureTime.getMinutes()).padStart(2, '0');
-                                dueDate = `${date}T${hours}:${minutes}:00`;
-                            } else {
-                                // 未来日期或今天早上9点前，默认早上9点
-                                dueDate = `${date}T09:00:00`;
-                            }
-                        }
-
-                        // 每次判断前重新获取提醒列表（确保实时性）
-                        const existingReminders = await this.getReminders();
-                        
-                        // 检查提醒是否已存在（标题和日期yyyy-mm-dd都要匹配）
-                        const existingReminder = existingReminders.find(r => {
-                            // 标题匹配（忽略首尾空格）
-                            const reminderTitle = r.title.trim();
-                            const taskTitleTrimmed = finalTaskTitle.trim();
-                            if (reminderTitle !== taskTitleTrimmed) return false;
-                            
-                            // 日期匹配（只比较yyyy-mm-dd部分）
-                            if (!r.due) return false;
-                            const reminderDate = r.due.split('T')[0]; // 提取 yyyy-mm-dd
-                            const isMatch = reminderDate === date;
-                            
-                            return isMatch;
-                        });
-
-                        if (existingReminder) {
-                            // 提醒已存在，检查是否需要标记为完成
-                            if (isCompleted) {
-                                await this.completeReminder(existingReminder.id);
-                                console.log(`[ReminderSync] 标记提醒为完成: ${finalTaskTitle}`);
-                            } else {
-                                console.log(`[ReminderSync] ✅ 跳过已存在的提醒: ${finalTaskTitle} @${date}`);
-                            }
-                        } else if (!isCompleted) {
-                            // 提醒不存在且任务未完成，创建新提醒
-                            console.log(`[ReminderSync] ➕ 创建提醒: ${finalTaskTitle} @${date}${finalHours ? ' ' + finalHours + ':' + finalMinutes : ''}`);
-                            await this.createReminder(finalTaskTitle.trim(), dueDate);
-                            createdCount++;
-                        }
-                        // 如果任务已完成且提醒不存在，则不做任何操作（避免创建已完成的提醒）
-                    }
-                }
-            }
-
-            if (!silent) {
-                new Notice(`同步完成！创建 ${createdCount} 个提醒`);
-            }
-            console.log(`[ReminderSync] 日记到提醒同步完成: 创建 ${createdCount} 个提醒`);
-
-        } catch (error) {
-            console.error('[ReminderSync] 同步失败:', error);
-            if (!silent) {
-                new Notice('同步失败，请查看控制台');
-            }
-        } finally {
-            // 释放锁 - 无论如何都会执行，确保锁一定被释放
-            console.log('[ReminderSync] 🔓 释放同步锁 (syncJournalsToReminders)');
-            this.syncLock = false;
-        }
-    }
-
-    // 同步记账到指定日期的日记
     async syncAccountingToJournal(date: string, entries: AccountingEntry[]): Promise<boolean> {
         try {
             const journalPath = `${this.config.journalsPath}/${date}.md`;
             const file = this.app.vault.getAbstractFileByPath(journalPath);
             
-            // 构建记账记录
             const records = entries.map(entry => {
                 const { expenseEmoji } = this.config;
-                // 如果金额为0（智能识别的），只记录关键词和描述
                 if (entry.amount === 0) {
                     return `- ${expenseEmoji}${entry.keyword} ${entry.description}`;
                 }
-                // 标准格式：关键词 金额 描述
                 return `- ${expenseEmoji}${entry.keyword} ${entry.amount}${entry.description ? ' ' + entry.description : ''}`;
             });
 
@@ -1222,7 +1042,6 @@ list.reminders.push(r);
         }
     }
 
-    // 同步打卡到指定日期的日记
     async syncHabitsToJournal(date: string, entries: HabitEntry[]): Promise<boolean> {
         try {
             const journalPath = `${this.config.journalsPath}/${date}.md`;
@@ -1230,7 +1049,6 @@ list.reminders.push(r);
             
             const { habitPrefix = '#' } = this.config;
             
-            // 构建打卡记录
             const records = entries.map(entry => {
                 return `- ${habitPrefix}${entry.habitKey} ${entry.description}`;
             });
@@ -1276,13 +1094,11 @@ list.reminders.push(r);
         }
     }
 
-    // 同步视频到指定日期的日记
     async syncVideosToJournal(date: string, entries: VideoEntry[]): Promise<boolean> {
         try {
             const journalPath = `${this.config.journalsPath}/${date}.md`;
             const file = this.app.vault.getAbstractFileByPath(journalPath);
             
-            // 构建视频记录
             const records = entries.map(entry => {
                 if (entry.title) {
                     return `- #${entry.typeKey} 《${entry.title}》${entry.comment ? ' ' + entry.comment : ''}`;
