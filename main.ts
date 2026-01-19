@@ -27,6 +27,7 @@ interface Reminder {
     id: string;
     title: string;
     due?: string;
+    creationDate?: string; // 创建日期
     list: string;
     completed: boolean;
 }
@@ -255,6 +256,7 @@ for(var i=0;i<listCount;i++){
             var r=allReminders[j];
             var isCompleted=r.completed();
             var dueDate=r.dueDate();
+            var creationDate=r.creationDate();
             if(isCompleted){
                 if(!dueDate||dueDate.toString()==='missing value')continue;
                 var dueDateTime=new Date(dueDate);
@@ -263,6 +265,9 @@ for(var i=0;i<listCount;i++){
             var item={title:r.name(),id:r.id(),list:listName,completed:isCompleted};
             if(dueDate&&dueDate.toString()!=='missing value'){
                 item.due=dueDate.toISOString();
+            }
+            if(creationDate&&creationDate.toString()!=='missing value'){
+                item.creationDate=creationDate.toISOString();
             }
             result.push(item);
         }catch(e){
@@ -421,7 +426,9 @@ JSON.stringify(result);
                 
                 entry.date = reminder.due 
                     ? formatLocalDate(new Date(reminder.due))
-                    : formatLocalDate(new Date());
+                    : reminder.creationDate
+                        ? formatLocalDate(new Date(reminder.creationDate))
+                        : formatLocalDate(new Date());
                 entry.reminderId = reminder.id;
                 
                 return { reminder, entry };
@@ -526,7 +533,9 @@ JSON.stringify(result);
             if (accountingEntry) {
                 accountingEntry.date = reminder.due 
                     ? formatLocalDate(new Date(reminder.due))
-                    : formatLocalDate(new Date());
+                    : reminder.creationDate
+                        ? formatLocalDate(new Date(reminder.creationDate))
+                        : formatLocalDate(new Date());
                 accountingEntry.reminderId = reminder.id;
                 accountingEntries.push({ reminder, entry: accountingEntry });
                 continue;
@@ -536,7 +545,9 @@ JSON.stringify(result);
             if (videoEntry) {
                 videoEntry.date = reminder.due 
                     ? formatLocalDate(new Date(reminder.due))
-                    : formatLocalDate(new Date());
+                    : reminder.creationDate
+                        ? formatLocalDate(new Date(reminder.creationDate))
+                        : formatLocalDate(new Date());
                 videoEntry.reminderId = reminder.id;
                 videoEntries.push({ reminder, entry: videoEntry });
                 continue;
@@ -546,7 +557,9 @@ JSON.stringify(result);
             if (habitEntry) {
                 habitEntry.date = reminder.due 
                     ? formatLocalDate(new Date(reminder.due))
-                    : formatLocalDate(new Date());
+                    : reminder.creationDate
+                        ? formatLocalDate(new Date(reminder.creationDate))
+                        : formatLocalDate(new Date());
                 habitEntry.reminderId = reminder.id;
                 habitEntries.push({ reminder, entry: habitEntry });
             }
