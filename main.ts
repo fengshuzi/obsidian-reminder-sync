@@ -1,8 +1,17 @@
 import { Plugin, Notice, TFile, Platform } from 'obsidian';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 const execAsync = promisify(exec);
+
+/** 嵌入 JXA 脚本中的字符串时转义反斜杠与单引号，避免脚本语法错误 */
+function escapeForJXA(s: string): string {
+    if (typeof s !== 'string') return '';
+    return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
 
 // 配置接口
 interface ReminderSyncConfig {
@@ -222,15 +231,33 @@ export default class ReminderSyncPlugin extends Plugin {
         }
     }
 
-    async runJXA(script: string): Promise<any> {
-        try {
-            const { stdout } = await execAsync(`osascript -l JavaScript -e "${script}"`, {
-                timeout: 30000
-            });
-            return stdout.trim();
-        } catch (error) {
-            console.error('[ReminderSync] JXA Error:', error);
+    /**
+     * 通过临时文件执行 JXA，避免 -e "..." 带来的 shell 转义与长度限制，提高稳定性。
+     */
+    async runJXA(script: string): Promise<string | null> {
+        if (!Platform.isMacOS) {
+            console.warn('[ReminderSync] JXA 仅支持 macOS');
             return null;
+        }
+        const tmpDir = os.tmpdir();
+        const tmpFile = path.join(tmpDir, `reminder-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.js`);
+        try {
+            fs.writeFileSync(tmpFile, script, 'utf8');
+            const { stdout } = await execAsync(`osascript -l JavaScript "${tmpFile}"`, {
+                timeout: 15000,
+                maxBuffer: 2 * 1024 * 1024
+            });
+            return stdout ? stdout.trim() : null;
+        } catch (error: any) {
+            const msg = error?.message || String(error);
+            if (!msg.includes('Command failed')) {
+                console.error('[ReminderSync] JXA Error:', error);
+            }
+            return null;
+        } finally {
+            try {
+                if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+            } catch (_) {}
         }
     }
 
@@ -238,52 +265,67 @@ export default class ReminderSyncPlugin extends Plugin {
         const threeDaysAgo = new Date();
         threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
         const threeDaysAgoISO = threeDaysAgo.toISOString();
-        
+        const listNameEscaped = escapeForJXA(this.config.reminderListName || 'Inbox');
+
         const script = `
-var Reminders=Application('Reminders');
-var result=[];
-var lists=Reminders.lists();
-var listCount=lists.length;
-var threeDaysAgo=new Date('${threeDaysAgoISO}');
-for(var i=0;i<listCount;i++){
-    var list=lists[i];
-    var listName=list.name();
-    if(listName!=='${this.config.reminderListName}')continue;
-    var allReminders=list.reminders();
-    var reminderCount=allReminders.length;
-    for(var j=0;j<reminderCount;j++){
-        try{
-            var r=allReminders[j];
-            var isCompleted=r.completed();
-            var dueDate=r.dueDate();
-            var creationDate=r.creationDate();
-            if(isCompleted){
-                if(!dueDate||dueDate.toString()==='missing value')continue;
-                var dueDateTime=new Date(dueDate);
-                if(dueDateTime<threeDaysAgo)continue;
+var Reminders = Application('Reminders');
+var result = [];
+try {
+    var lists = Reminders.lists();
+    var listCount = lists.length;
+    var threeDaysAgo = new Date('${threeDaysAgoISO}');
+    var targetListName = '${listNameEscaped}';
+    for (var i = 0; i < listCount; i++) {
+        var list = lists[i];
+        var listName = list.name();
+        if (listName !== targetListName) continue;
+        var allReminders = list.reminders();
+        var reminderCount = allReminders.length;
+        for (var j = 0; j < reminderCount; j++) {
+            try {
+                var r = allReminders[j];
+                var isCompleted = r.completed();
+                var dueDate = r.dueDate ? r.dueDate() : null;
+                var dueStr = (dueDate && dueDate.toString && dueDate.toString() !== 'missing value') ? dueDate : null;
+                if (isCompleted && dueStr) {
+                    try {
+                        var dueDateTime = new Date(dueStr);
+                        if (dueDateTime < threeDaysAgo) continue;
+                    } catch (e2) { }
+                }
+                var title = r.name ? r.name() : '';
+                var id = r.id ? r.id() : '';
+                var item = { title: title, id: id, list: listName, completed: isCompleted };
+                if (dueStr) {
+                    try {
+                        item.due = (typeof dueStr.toISOString === 'function') ? dueStr.toISOString() : String(dueStr);
+                    } catch (e3) { }
+                }
+                try {
+                    var creationDate = r.creationDate ? r.creationDate() : null;
+                    if (creationDate && creationDate.toString && creationDate.toString() !== 'missing value' && typeof creationDate.toISOString === 'function') {
+                        item.creationDate = creationDate.toISOString();
+                    }
+                } catch (e4) { }
+                result.push(item);
+            } catch (e) {
+                continue;
             }
-            var item={title:r.name(),id:r.id(),list:listName,completed:isCompleted};
-            if(dueDate&&dueDate.toString()!=='missing value'){
-                item.due=dueDate.toISOString();
-            }
-            if(creationDate&&creationDate.toString()!=='missing value'){
-                item.creationDate=creationDate.toISOString();
-            }
-            result.push(item);
-        }catch(e){
-            continue;
         }
+        break;
     }
-    break;
+} catch (e) {
+    result = [];
 }
 JSON.stringify(result);
-        `.replace(/\n/g, '');
+`;
 
         const output = await this.runJXA(script);
         if (!output) return [];
 
         try {
-            return JSON.parse(output);
+            const parsed = JSON.parse(output);
+            return Array.isArray(parsed) ? parsed : [];
         } catch (error) {
             console.error('[ReminderSync] Parse Error:', error);
             return [];
@@ -766,25 +808,36 @@ JSON.stringify(result);
     }
 
     async deleteReminder(id: string): Promise<boolean> {
-        const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.delete();'ok';`;
+        const idEscaped = escapeForJXA(String(id || ''));
+        if (!idEscaped && id !== '') return false;
+        const script = `var Reminders = Application('Reminders'); var r = Reminders.reminders.byId('${idEscaped}'); if (r) { r.delete(); } 'ok';`;
         const result = await this.runJXA(script);
         return result !== null;
     }
 
     async createReminder(title: string, dueDate: string): Promise<boolean> {
+        const titleEscaped = escapeForJXA(String(title || ''));
+        const dueEscaped = escapeForJXA(String(dueDate || ''));
+        const listNameEscaped = escapeForJXA(this.config.reminderListName || 'Inbox');
         const script = `
-var Reminders=Application('Reminders');
-var list=Reminders.lists.whose({name:'${this.config.reminderListName}'})[0];
-var r=Reminders.Reminder({name:'${title}',dueDate:new Date('${dueDate}')});
-list.reminders.push(r);
-'ok';
-        `.replace(/\n/g, '');
+var Reminders = Application('Reminders');
+var list = Reminders.lists.whose({ name: '${listNameEscaped}' })[0];
+var out = 'error';
+if (list) {
+    var r = Reminders.Reminder({ name: '${titleEscaped}', dueDate: new Date('${dueEscaped}') });
+    list.reminders.push(r);
+    out = 'ok';
+}
+out;
+`;
         const result = await this.runJXA(script);
-        return result !== null;
+        return result !== null && result !== 'error';
     }
 
     async completeReminder(id: string): Promise<boolean> {
-        const script = `var Reminders=Application('Reminders');var r=Reminders.reminders.byId('${id}');r.completed=true;'ok';`;
+        const idEscaped = escapeForJXA(String(id || ''));
+        if (!idEscaped && id !== '') return false;
+        const script = `var Reminders = Application('Reminders'); var r = Reminders.reminders.byId('${idEscaped}'); if (r) { r.completed = true; } 'ok';`;
         const result = await this.runJXA(script);
         return result !== null;
     }
